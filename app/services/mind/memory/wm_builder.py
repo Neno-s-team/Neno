@@ -1,0 +1,302 @@
+"""工作记忆拼装：固定槽位顺序，超预算按槽位优先级裁剪。"""
+
+from __future__ import annotations
+
+import time
+from datetime import datetime
+from typing import Any
+
+from app import config
+from app.services.mind import clock
+from app.services.mind import concerns, intents, relationship, timeline, wishes
+from app.services.mind.memory import retrieval
+from app.storage.db import fetch_all
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    ZoneInfo = None
+
+_WEEKDAYS = ("一", "二", "三", "四", "五", "六", "日")
+
+
+def _local_now() -> datetime:
+    if ZoneInfo is not None:
+        return clock.local_now()
+    return datetime.now()
+
+
+def period_word(hour: int) -> str:
+    """时段词：早晨/上午/中午/下午/晚上/深夜/凌晨（与一致性检查共用表）。"""
+    if 5 <= hour < 9:
+        return "早晨"
+    if 9 <= hour < 12:
+        return "上午"
+    if 12 <= hour < 13:
+        return "中午"
+    if 13 <= hour < 18:
+        return "下午"
+    if 18 <= hour < 23:
+        return "晚上"
+    if hour == 23:
+        return "深夜"
+    return "凌晨"
+
+
+def _seconds_since_last_user_message(history: list[dict]) -> float | None:
+    now = clock.now()
+    for item in reversed(history):
+        if item.get("role") != "user":
+            continue
+        created_at = item.get("created_at")
+        if not created_at:
+            return None
+        try:
+            stamp = datetime.strptime(str(created_at), "%Y-%m-%d %H:%M:%S").replace(
+                tzinfo=ZoneInfo("UTC") if ZoneInfo else None
+            ).timestamp()
+        except ValueError:
+            return None
+        return max(0.0, now - stamp)
+    return None
+
+
+def _render_situation(situation: dict[str, Any]) -> str:
+    lines = [f"现在是 {situation.get('today') or situation['local_time']}"]
+    gap = situation.get("seconds_since_last_user_message")
+    if gap is not None:
+        lines.append(f"他上一条消息是 {timeline.gap(gap)}前")
+    if situation.get("doing"):
+        lines.append(f"你此刻在{situation.get('place') or '某处'}，{situation['doing']}")
+        if situation.get("body"):
+            lines.append(f"身上：{situation['body']}")
+        if situation.get("broken"):
+            lines.append(f"坏着没修好的：{situation['broken']}")
+        for note in situation.get("contacts") or []:
+            lines.append(f"今天：{note}")
+        if situation.get("last_thought"):
+            lines.append(f"你{situation['last_thought']}")
+    if situation.get("home"):
+        lines.append(situation["home"])
+    if situation.get("day_note"):
+        lines.append(f"今天：{situation['day_note']}")
+    if situation.get("weather"):
+        lines.append(f"外面：{situation['weather']}")
+    if situation.get("moments"):
+        lines.append("今天碰到的小事（聊到可以随口提，不用都说）：")
+        lines.extend(f"- {item}" for item in situation["moments"])
+    if situation.get("money"):
+        lines.append(f"手头：{situation['money']}")
+    if situation.get("tasks"):
+        lines.append("手上要交的事：")
+        lines.extend(f"- {item}" for item in situation["tasks"])
+    if situation.get("happenings"):
+        lines.append("你知道最近的事（被问到、聊到可以提，不用主动报）：")
+        lines.extend(f"- {item}" for item in situation["happenings"])
+    lines.append(f"可打断等级：{situation['interrupt_level']}（world={situation['world']}）")
+    for notice in situation.get("retracted") or []:
+        lines.append(notice)
+    return "\n".join(lines)
+
+
+def retracted_notices(session_id: str, *, after_ts: float = 0.0) -> list[str]:
+    """已撤回且被看到过的感知记录 → 当前情境里的一句提示。"""
+    rows = fetch_all(
+        """SELECT p.trace_id, p.retracted_seen, p.preview_text,
+                  (SELECT content FROM messages m WHERE m.trace_id = p.trace_id AND m.role = 'user'
+                   ORDER BY m.id LIMIT 1) AS content
+           FROM mind_perception p
+           WHERE p.session_id = ? AND p.retracted = 1 AND p.seen != 'none' AND p.updated_at >= ?""",
+        (session_id, after_ts),
+    )
+    notices: list[str] = []
+    for row in rows:
+        # 只瞥过预览的只知道预览那几个字；点开过的知道全文
+        if row["retracted_seen"] == "preview":
+            preview = (row["preview_text"] or "")[:30]
+        else:
+            preview = (row["content"] or row["preview_text"] or "")[:60]
+        notices.append(f"对方撤回了一条消息（你看到过：{preview}）")
+    return notices
+
+
+def _render_episode(episode: dict[str, Any]) -> str:
+    if ZoneInfo is not None:
+        stamp = datetime.fromtimestamp(
+            float(episode["ts"]), tz=ZoneInfo(config.MIND_TIMEZONE)
+        ).strftime("%m-%d %H:%M")
+    else:
+        stamp = datetime.fromtimestamp(float(episode["ts"])).strftime("%m-%d %H:%M")
+    valence = float(episode.get("valence") or 0.0)
+    arousal = float(episode.get("arousal") or 0.0)
+    vague = "（只记得个大概）" if episode.get("faded_at") else ""
+    when = timeline.ago(float(episode["ts"]))
+    return (
+        f"- #{episode['id']} [{when}，{stamp}]（情绪 v={valence:+.2f} a={arousal:.2f}）{vague}{episode['summary']}"
+    )
+
+
+def _render_belief(belief: dict[str, Any]) -> str:
+    return f"- {belief['subject']}：{belief['content']}（可信度 {float(belief['confidence']):.2f}）"
+
+
+def build_working_memory(
+    session_id: str,
+    *,
+    l1: Any,
+    message: str,
+    history: list[dict],
+    self_card: str,
+    now: float | None = None,
+    retracted: list[str] | None = None,
+) -> dict[str, Any]:
+    """拼装工作记忆包；返回 dict + 渲染文本 + 裁剪记录。"""
+    current = now if now is not None else clock.now()
+    local = _local_now()
+    situation = {
+        "local_time": local.strftime("%Y-%m-%d %H:%M"),
+        "today": timeline.today_line(current),
+        "weekday": _WEEKDAYS[local.weekday()],
+        "period": period_word(local.hour),
+        "seconds_since_last_user_message": _seconds_since_last_user_message(history),
+        "interrupt_level": 3,
+        "world": "unavailable",
+    }
+    from app.services.mind import schedule as mind_schedule
+
+    seg = mind_schedule.segment_at(current, session_id=session_id)
+    situation["interrupt_level"] = int(seg.get("level", 3))
+    situation["world"] = seg.get("world", "unavailable")
+    if seg.get("world") == "live":
+        # 世界里她真实在做的事：她知道自己在干嘛，不用编
+        situation["doing"] = seg.get("activity")
+        situation["place"] = seg.get("place")
+        if seg.get("body"):
+            situation["body"] = seg["body"]
+        if seg.get("broken"):
+            situation["broken"] = seg["broken"]
+        for name in ("home", "day_note", "weather", "happenings", "money", "tasks", "moments"):
+            if seg.get(name):
+                situation[name] = seg[name]
+        if seg.get("contacts"):
+            situation["contacts"] = seg["contacts"]
+        if seg.get("last_thought"):
+            situation["last_thought"] = seg["last_thought"]
+    if retracted is not None:
+        situation["retracted"] = retracted
+    # 已撤回且被看到过的消息：即使调用方没传，也补进当前情境
+    if not situation.get("retracted"):
+        notices = retracted_notices(session_id)
+        if notices:
+            situation["retracted"] = notices
+    cues = [str(cue) for cue in (getattr(l1, "cues", None) or [])]
+    episodes = retrieval.retrieve_episodes(
+        session_id,
+        cues,
+        message,
+        limit=max(1, int(config.MIND_WM_EPISODES)),
+        apply_recall_boost=True,
+    )
+    beliefs = retrieval.retrieve_beliefs(
+        session_id, cues, message, limit=max(1, int(config.MIND_WM_BELIEFS))
+    )
+    recent_turns = [
+        {
+            "role": item.get("role"),
+            "content": str(item.get("content") or "")[:300],
+            "created_at": item.get("created_at"),
+        }
+        for item in history
+        if item.get("role") in ("user", "assistant")
+    ][-max(2, int(config.MIND_RECENT_TURNS)):]
+
+    memory = {
+        "situation": situation,
+        "relationship": relationship.describe(session_id),
+        "concerns": concerns.render(concerns.top(session_id)) + intents.render(session_id) + wishes.render(session_id),
+        "episodes": episodes,
+        "beliefs": beliefs,
+        "recent_turns": recent_turns,
+        "self_card": self_card,
+    }
+    trimmed = _trim_to_budget(memory)
+    # 给 L2 的渲染文本不带自我卡（自我卡已在 system 里，避免出现两次）；
+    # wm_json 里保留槽位，回放/其他用途可完整渲染。
+    text = render_working_memory(memory, include_self_card=False)
+    return {
+        "situation": situation,
+        "relationship": memory.get("relationship", ""),
+        "concerns": memory["concerns"],
+        "episodes": memory["episodes"],
+        "beliefs": memory["beliefs"],
+        "recent_turns": memory["recent_turns"],
+        "self_card": memory["self_card"],
+        "text": text,
+        "trimmed": trimmed,
+    }
+
+
+def _budget() -> int:
+    return max(400, int(config.MIND_WM_MAX_CHARS))
+
+
+def _trim_to_budget(memory: dict[str, Any]) -> list[str]:
+    """裁剪顺序：经历 → 认识 → 最近原话（各保留最少 2 条），最后截短 summary。"""
+    trimmed: list[str] = []
+    if len(render_working_memory(memory, include_self_card=False)) <= _budget():
+        return trimmed
+
+    def over() -> bool:
+        return len(render_working_memory(memory, include_self_card=False)) > _budget()
+
+    # ① 减少经历条数，最少 2
+    while over() and len(memory["episodes"]) > 2:
+        memory["episodes"].pop()
+        trimmed.append("episodes")
+    # ② 减少认识条数，最少 2
+    while over() and len(memory["beliefs"]) > 2:
+        memory["beliefs"].pop()
+        trimmed.append("beliefs")
+    # ③ 减少最近原话条数，最少 2
+    while over() and len(memory["recent_turns"]) > 2:
+        memory["recent_turns"].pop(0)
+        trimmed.append("recent_turns")
+    # ④ 截短每段 summary（自我卡不裁剪）
+    if over():
+        trimmed.append("summaries")
+        for item in memory["episodes"]:
+            item["summary"] = str(item.get("summary") or "")[:60]
+            if not over():
+                break
+        for item in memory["beliefs"]:
+            item["content"] = str(item.get("content") or "")[:60]
+            if not over():
+                break
+        for item in memory["recent_turns"]:
+            item["content"] = str(item.get("content") or "")[:80]
+            if not over():
+                break
+    return trimmed
+
+
+def render_working_memory(memory: dict[str, Any], *, include_self_card: bool = True) -> str:
+    sections: list[str] = []
+    sections.append("【当前情境】\n" + _render_situation(memory["situation"]))
+    if memory.get("relationship"):
+        sections.append("【你和他】\n" + memory["relationship"])
+    concerns = memory.get("concerns") or []
+    if concerns:
+        sections.append("【在意事项】\n" + "\n".join(f"- {item}" for item in concerns))
+    episodes = memory.get("episodes") or []
+    if episodes:
+        sections.append("【相关经历】\n" + "\n".join(_render_episode(item) for item in episodes))
+    beliefs = memory.get("beliefs") or []
+    if beliefs:
+        sections.append("【认识】\n" + "\n".join(_render_belief(item) for item in beliefs))
+    recent = memory.get("recent_turns") or []
+    if recent:
+        lines = timeline.turns_with_time(recent, me="你", other="他")
+        sections.append("【最近原话】\n" + "\n".join(lines))
+    if include_self_card and memory.get("self_card"):
+        sections.append("【自我卡】\n" + memory["self_card"])
+    return "\n\n".join(sections)

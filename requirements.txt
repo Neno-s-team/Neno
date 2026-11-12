@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+requests
+python-dotenv
+pydantic
+httpx
+pytest
+Pillow>=10.4
+tzdata

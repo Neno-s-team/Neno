@@ -1,0 +1,247 @@
+"""P3a 后台调度器：SQL 取到期项，线程池执行，不阻塞事件循环。
+
+同一时刻只有一个批次在跑；上一批没跑完就跳过本次 tick。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import threading
+
+from app import config
+from app.services.mind import clock, perception, store
+from app.storage.db import fetch_all
+from app.utils.logging_utils import log_event
+
+_session_locks: dict[str, threading.Lock] = {}
+_batch_lock = threading.Lock()
+_batch_running = False
+
+
+def _lock(session_id: str) -> threading.Lock:
+    lock = _session_locks.get(session_id)
+    if lock is None:
+        lock = threading.Lock()
+        _session_locks[session_id] = lock
+    return lock
+
+
+def process_glance(session_id: str, trace_id: str) -> None:
+    """到期的 glance → L0（预览/打开）。打开后交给 handle_opened 写作业。"""
+    with _lock(session_id):
+        record = store.get_perception_by_trace(trace_id)
+        if record is None or record["retracted"]:
+            return
+        if record["status"] not in ("pending", "previewed"):
+            return
+        after = perception.glance(session_id, trace_id)
+        if after and after["status"] == "opened" and after["seen"] == "opened":
+            # 点开聊天就看到全部未读：同 session 其余 pending/previewed 一起置 opened
+            store.open_unread_perceptions(session_id, float(after["seen_at"]))
+            trace_ids = _open_batch(session_id)
+            if trace_ids:
+                from app.services.mind import orchestration
+
+                # handle_opened 只做感知/决策/写作业，不跑周期
+                orchestration.handle_opened(session_id, trace_ids)
+
+
+def recover_stuck_opened() -> int:
+    """opened 卡住（seen_at 早于 grace 且无 pending/running 作业）→ 重跑 handle_opened。"""
+    from app.services.mind import orchestration
+
+    ts = clock.now()
+    grace = max(0.0, float(getattr(config, "MIND_OPENED_GRACE_SEC", 30)))
+    rows = store.stuck_opened_perceptions(ts, grace)
+    recovered = 0
+    by_session: dict[str, list[str]] = {}
+    for row in rows:
+        by_session.setdefault(row["session_id"], []).append(str(row["trace_id"]))
+    for session_id, trace_ids in by_session.items():
+        # 有新消息马上就要被看到（如想到一半被打断后）：等它点开时一起合批，不单独恢复
+        if any(float(item["glance_at"]) <= ts + grace
+               for item in store.newer_unseen_perceptions(session_id, 0.0)):
+            continue
+        records = [store.get_perception_by_trace(item) for item in trace_ids]
+        ids = [int(r["id"]) for r in records if r is not None]
+        max_attempts = max(1, int(config.MIND_JOB_MAX_ATTEMPTS))
+        over_limit = [r for r in records
+                      if r is not None and int(r.get("attempts") or 0) >= max_attempts]
+        if over_limit:
+            for r in over_limit:
+                store.update_perception(int(r["id"]), status="failed")
+            log_event("mind", "mind_job_failed", session_id=session_id,
+                      attempts=max_attempts, traces=json.dumps(trace_ids),
+                      reason="opened_grace_exceeded")
+            continue
+        store.increment_perception_attempts(ids)
+        try:
+            with _lock(session_id):
+                orchestration.handle_opened(session_id, trace_ids)
+            recovered += len(trace_ids)
+        except Exception as exc:
+            # attempts 计数已加；超限后下个 tick 标 failed
+            log_event("mind", "opened_recovery_failed", session_id=session_id,
+                      error_type=type(exc).__name__, trace_count=len(trace_ids))
+    return recovered
+
+
+def _open_batch(session_id: str) -> list[str]:
+    """取出该 session 全部 opened 未决策的 trace（真人一次看到全部未读）。"""
+    rows = fetch_all(
+        """SELECT trace_id FROM mind_perception
+           WHERE session_id = ? AND status = 'opened' AND seen = 'opened' AND retracted = 0
+           ORDER BY received_at ASC""",
+        (session_id,),
+    )
+    return [str(row["trace_id"]) for row in rows]
+
+
+def process_deferred(session_id: str, deferred_id: int) -> None:
+    """到期的回复作业：租约领取 → run_async_cycle → 成功后 perception=decided。"""
+    with _lock(session_id):
+        from app.services.mind import orchestration
+
+        try:
+            orchestration.run_reply_job(deferred_id)
+        except Exception as exc:
+            job = store.get_deferred(deferred_id) or {}
+            attempts = int(job.get("attempts") or 0)
+            if attempts >= max(1, int(config.MIND_JOB_MAX_ATTEMPTS)):
+                store.update_deferred(deferred_id, status="failed")
+                _fail_job_perceptions(deferred_id, session_id)
+            else:
+                # 退回 pending，租约过期后由下一个 tick 重领
+                store.update_deferred(deferred_id, status="pending", lease_until=None)
+                log_event("mind", "mind_job_retry", session_id=session_id,
+                          candidate_id=deferred_id, attempts=attempts,
+                          error_type=type(exc).__name__)
+
+
+def process_due_batch(limit: int = 50) -> dict[str, int]:
+    """串行处理所有到期项（同 session 串行；先串行实现，写进文档）。"""
+    ts = clock.now()
+    done = {"glances": 0, "deferred": 0}
+    recover_stale_jobs()
+    recover_stuck_opened()
+    for record in store.due_perceptions(ts, limit=limit):
+        try:
+            process_glance(record["session_id"], record["trace_id"])
+            done["glances"] += 1
+        except Exception as exc:
+            log_event("mind", "scheduler_glance_failed", trace_id=record["trace_id"],
+                      session_id=record["session_id"], error_type=type(exc).__name__)
+    for record in store.due_deferred(ts, limit=limit):
+        try:
+            process_deferred(record["session_id"], record["id"])
+            done["deferred"] += 1
+        except Exception as exc:
+            log_event("mind", "scheduler_deferred_failed",
+                      session_id=record["session_id"], error_type=type(exc).__name__)
+    if config.MIND_REFLECT_ENABLED:
+        done["reflections"] = process_reflections(ts)
+    done["proactive"] = process_proactive(ts)
+    return done
+
+
+def process_proactive(ts: float) -> int:
+    """主动找他：只对"家"会话（接着世界的那个），和回复作业同一把会话锁。默认关（MIND_PROACTIVE）。"""
+    from app.services.mind import proactive
+
+    session_id = config.MIND_HOME_SESSION
+    if proactive.mode() == "off" or not session_id or not config.MIND_ASYNC_DELIVERY:
+        return 0
+    with _lock(session_id):
+        try:
+            return 1 if proactive.tick(session_id, ts).get("outcome") else 0
+        except Exception as exc:
+            log_event("mind", "proactive_tick_failed", session_id=session_id, error_type=type(exc).__name__)
+            return 0
+
+
+def process_reflections(ts: float) -> int:
+    """睡着了就给今天聊过的会话排一次反思；到点的领租约跑（与回复作业同一把 session 锁）。"""
+    from app.services.mind import reflection
+
+    for session_id in reflection.active_sessions(ts - 2 * 86400):
+        reflection.plan_tonight(session_id, ts)
+    ran = 0
+    for row in reflection.claim_due(ts):
+        with _lock(row["session_id"]):
+            try:
+                result = reflection.run(row)
+                reflection.finish(row, result)
+                log_event("mind", "reflection_done", session_id=row["session_id"], night=row["night"],
+                          **{k: v for k, v in result.items() if isinstance(v, (int, str))})
+                ran += 1
+            except Exception as exc:
+                reflection.finish(row, error=type(exc).__name__)
+                log_event("mind", "reflection_failed", session_id=row["session_id"], night=row["night"],
+                          attempts=row.get("attempts"), error_type=type(exc).__name__)
+    return ran
+
+
+def _fail_job_perceptions(deferred_id: int, session_id: str) -> None:
+    """作业最终 failed：把 queue 中的 perception 一并标 failed。"""
+    job = store.get_deferred(deferred_id) or {}
+    trace_ids = [str(item) for item in json.loads(job.get("trace_ids_json") or "[]")]
+    store.fail_queued_perceptions(deferred_id)
+    log_event("mind", "mind_job_failed", session_id=session_id,
+              candidate_id=deferred_id, traces=json.dumps(trace_ids))
+
+
+def _try_run_batch() -> None:
+    """批次互斥：上一批没跑完直接跳过（不排队堆积）。"""
+    global _batch_running
+    with _batch_lock:
+        if _batch_running:
+            return
+        _batch_running = True
+    try:
+        process_due_batch()
+    finally:
+        with _batch_lock:
+            _batch_running = False
+
+
+async def _tick_loop() -> None:
+    while True:
+        try:
+            # to_thread：LLM/DB 都在线程池里跑，不阻塞事件循环
+            await asyncio.to_thread(_try_run_batch)
+        except Exception as exc:
+            log_event("mind", "scheduler_tick_failed", error_type=type(exc).__name__)
+        await asyncio.sleep(max(0.5, float(config.MIND_SCHEDULER_TICK_SEC)))
+
+
+_task: asyncio.Task | None = None
+
+
+def start() -> None:
+    """启动 tick 循环；恢复逻辑由每个 tick 的 recover_stale_jobs 完成。"""
+    global _task
+    if _task is None:
+        _task = asyncio.create_task(_tick_loop(), name="mind-scheduler")
+
+
+def recover_stale_jobs() -> None:
+    """running 但租约过期 → pending；attempts 超限 → failed。"""
+    ts = clock.now()
+    max_attempts = max(1, int(config.MIND_JOB_MAX_ATTEMPTS))
+    for record in store.stale_running_deferred(ts, limit=100):
+        attempts = int(record.get("attempts") or 0)
+        if attempts >= max_attempts:
+            store.update_deferred(record["id"], status="failed")
+            _fail_job_perceptions(int(record["id"]), record["session_id"])
+        elif (record["lease_until"] or 0) < ts:
+            store.update_deferred(record["id"], status="pending", lease_until=None)
+            log_event("mind", "scheduler_deferred_recovered",
+                      session_id=record["session_id"], candidate_id=record["id"])
+
+
+def stop() -> None:
+    global _task
+    if _task is not None:
+        _task.cancel()
+        _task = None

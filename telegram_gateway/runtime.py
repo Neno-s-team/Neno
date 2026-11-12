@@ -1,0 +1,431 @@
+from __future__ import annotations
+
+import asyncio
+import argparse
+import json
+import sqlite3
+import logging
+import mimetypes
+import os
+import tempfile
+import time
+from pathlib import Path
+from typing import Any
+
+from telegram_gateway.config import GatewayConfig
+from telegram_gateway.core_client import NenoCoreClient
+from telegram_gateway.auth import authorize
+from telegram_gateway.normalize import InboundMessage, parse_update, project_non_image_message
+from telegram_gateway.policy import accepts_chat
+from telegram_gateway.sticker_table import StickerTable, StickerTableInjector
+from telegram_gateway.tdlib_client import TdlibClient
+
+logging.getLogger().setLevel(logging.INFO)  # 发送回执走 INFO 级，保证可见
+
+
+class TelegramFloodWait(RuntimeError):
+    def __init__(self, retry_after: int):
+        self.retry_after = max(1, int(retry_after))
+        super().__init__(f"Telegram flood wait: retry after {self.retry_after}s")
+
+
+def split_outbound_text(text: str, limit: int = 4096) -> list[str]:
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    lines = [line.strip() for line in normalized.split("\n") if line.strip()]
+    if not lines:
+        lines = ["抱歉，我刚刚没能生成回复。"]
+    return [line[index : index + limit] for line in lines for index in range(0, len(line), limit)]
+
+
+class TelegramGateway:
+    def __init__(self, config: GatewayConfig):
+        self.config = config
+        self.tdlib = TdlibClient(config.sidecar_binary, config.tdjson_library)
+        self.core = NenoCoreClient(config.core_url, config.internal_token)
+        self._chat_locks: dict[int, asyncio.Lock] = {}
+        # 每条消息都带表情包表（一次性上下文，core 落库时剥离）：
+        # 名字表必须每轮可见，否则模型下一轮就忘了能发什么。
+        self.stickers = StickerTable.load_optional(config.sticker_pack_dir)
+        self._sticker_injector = StickerTableInjector(self.stickers, mode="always")
+        from telegram_gateway.delivery import Delivery
+        self.delivery = Delivery(self)
+        # 网关侧补列：inbox.retract_state（P3b 撤回持久化重试）
+        with self.delivery.store.connect() as c:
+            columns = {row["name"] for row in c.execute("PRAGMA table_info(inbox)").fetchall()}
+            if "retract_state" not in columns:
+                c.execute("ALTER TABLE inbox ADD COLUMN retract_state TEXT")
+        self.tdlib.send_status_observer = self._send_status_receipt
+        self._delivery_task = None
+        self._mind_task = None
+        self._mind_runner = None
+        if getattr(config, "mind_async", False):
+            from telegram_gateway.mind_runner import MindRunner
+            self._mind_runner = MindRunner(self)
+
+    def _send_status_receipt(self, update: dict[str, Any]) -> None:
+        # 一份回执更新两套账本：旧 outbox 与异步 mind_outbox
+        self.delivery.receipt(update)
+        if self._mind_runner is not None:
+            self._mind_runner.receipt(update)
+
+    async def close(self) -> None:
+        self.delivery.stopping = True
+        if self._mind_runner is not None:
+            await self._mind_runner.stop()
+        if self._mind_task:
+            self._mind_task.cancel()
+            try:
+                await self._mind_task
+            except asyncio.CancelledError:
+                pass
+        if self._delivery_task:
+            self._delivery_task.cancel()
+            try:
+                await self._delivery_task
+            except asyncio.CancelledError:
+                pass
+        await self.core.close()
+        await self.tdlib.close()
+
+    async def start(self) -> None:
+        self.config.database_directory.mkdir(parents=True, exist_ok=True)
+        self.config.files_directory.mkdir(parents=True, exist_ok=True)
+        await self.tdlib.start()
+        await self.tdlib.send(self.config.tdlib_parameters_request())
+        await authorize(
+            self.tdlib,
+            interactive=False,
+            database_encryption_key_b64=self.config.database_encryption_key_b64(),
+        )
+        me = await self.tdlib.request({'@type': 'getMe'}, timeout=30)
+        if me.get('@type') != 'user' or not me.get('id'):
+            raise RuntimeError('Telegram authorization completed but getMe failed')
+        logging.info('Telegram authorization ready; durable delivery enabled')
+
+    async def run(self) -> None:
+        await self.start()
+        await self.run_updates()
+
+    async def run_updates(self) -> None:
+        self._delivery_task = asyncio.create_task(self.delivery.run(), name='durable-telegram-delivery')
+        if self._mind_runner is not None:
+            self._mind_task = asyncio.create_task(self._mind_runner.run(), name='mind-delivery-runner')
+        async for update in self.tdlib.updates():
+            state_type = str(update.get("@type") or "")
+            if state_type == "updateAuthorizationState":
+                continue
+            if state_type == "updateDeleteMessages":
+                raw_chat_id = int(update.get("chat_id") or 0)
+                if accepts_chat(raw_chat_id, self.config.allowed_chat_ids):
+                    await self._handle_retract_update(update, raw_chat_id)
+                continue
+            message = parse_update(update)
+            if message is None:
+                if state_type == "updateNewMessage":
+                    raw = update.get("message") or {}
+                    if not raw.get("is_outgoing"):
+                        content = (raw.get("content") or {}).get("@type")
+                        logging.warning(
+                            "inbound update dropped by normalizer: content_type=%s", content
+                        )
+                continue
+            if not accepts_chat(message.chat_id, self.config.allowed_chat_ids):
+                continue
+            self.delivery.accept(message)
+
+    async def _handle_retract_update(self, update: dict[str, Any], chat_id: int) -> None:
+        """updateDeleteMessages：只处理永久删除且非缓存事件的入站撤回。"""
+        if update.get("is_permanent") is not True or update.get("from_cache") is not False:
+            return
+        for message_id in update.get("message_ids") or []:
+            row = self.delivery.store.one(
+                "SELECT key, trace_id, state, payload FROM inbox WHERE chat_id=? AND message_id=?",
+                (chat_id, int(message_id)),
+            )
+            if row is None:
+                continue
+            if self._mind_runner is None:
+                # 同步模式：只记日志，不调 core
+                logging.info("retract ignored (sync mode) chat=%s message_id=%s", chat_id, message_id)
+                continue
+            trace_id = row.get("trace_id")
+            if not trace_id and (row.get("state") == "generating" or row.get("payload")):
+                # 交给 core 的调用正在进行，或 payload 已生成待重试：等拿到 trace 后补撤
+                self.delivery.store.write(
+                    "UPDATE inbox SET retract_state='pending' WHERE key=?",
+                    (row["key"],),
+                )
+                logging.info("retract pending (generating) chat=%s message_id=%s", chat_id, message_id)
+                continue
+            if not trace_id:
+                # 从没提交过（payload 为空）：直接取消，不调 core
+                self.delivery.store.write(
+                    "UPDATE inbox SET state='cancelled', retract_state='cancelled', updated_at=? WHERE key=?",
+                    (time.time(), row["key"]),
+                )
+                logging.info("retract cancelled before core chat=%s message_id=%s", chat_id, message_id)
+                continue
+            try:
+                await self.core.mind_retract(str(trace_id))
+                self.delivery.store.write(
+                    "UPDATE inbox SET retract_state='done', updated_at=? WHERE key=?",
+                    (time.time(), row["key"]),
+                )
+            except Exception as exc:
+                # 失败持久化为待重试
+                self.delivery.store.write(
+                    "UPDATE inbox SET retract_state='retry', error=?, updated_at=? WHERE key=?",
+                    (str(exc)[:250], time.time(), row["key"]),
+                )
+                logging.warning("retract retry scheduled chat=%s message_id=%s error=%s",
+                                chat_id, message_id, type(exc).__name__)
+
+    @staticmethod
+    def _media_suffix(message: InboundMessage) -> str:
+        suffix = Path(message.file_name or "").suffix.lower()
+        if suffix and len(suffix) <= 10 and suffix.replace(".", "").isalnum():
+            return suffix
+        guessed = mimetypes.guess_extension(message.mime_type or "")
+        return guessed or ".bin"
+
+    async def _download_file(self, file_id: int, suffix: str) -> Path:
+        response = await self.tdlib.request(
+            {
+                "@type": "downloadFile",
+                "file_id": file_id,
+                "priority": 32,
+                "offset": 0,
+                "limit": 0,
+                "synchronous": True,
+            },
+            timeout=self.config.download_timeout_seconds,
+        )
+        local = response.get("local") or {}
+        path = Path(str(local.get("path") or ""))
+        if not path.is_file() or path.stat().st_size > self.config.max_media_bytes:
+            raise RuntimeError("Telegram media is missing or exceeds configured size")
+        temp_root = Path(tempfile.gettempdir()) / "neno-telegram"
+        temp_root.mkdir(parents=True, exist_ok=True)
+        destination = temp_root / f"{file_id}{suffix}"
+        destination.write_bytes(path.read_bytes())
+        return destination
+
+    async def _send_confirmed(
+        self, request: dict[str, Any], *, chat_id: int, kind: str, detail: str
+    ) -> tuple[dict[str, Any], str]:
+        """Send one message and observe TDLib's final network result.
+
+        A sendMessage response is only local acceptance. Explicit failures are
+        retried once; an acknowledgement timeout is marked uncertain and is not
+        retried, because retrying an already-accepted request could duplicate it.
+        """
+        for attempt in range(1, 3):
+            response = await self.tdlib.request(request, timeout=60)
+            message_id = response.get("id") if isinstance(response, dict) else None
+            try:
+                status = await self.tdlib.wait_message_send_result(int(message_id), timeout=8)
+            except (asyncio.TimeoutError, TypeError, ValueError):
+                logging.warning(
+                    "outbound delivery uncertain chat=%s message_id=%s kind=%s detail=%s",
+                    chat_id, message_id, kind, detail,
+                )
+                return response, "uncertain"
+            status_type = str(status.get("@type") or "")
+            if status_type == "updateMessageSendSucceeded":
+                logging.info(
+                    "outbound delivery confirmed chat=%s message_id=%s kind=%s detail=%s attempt=%d",
+                    chat_id, message_id, kind, detail, attempt,
+                )
+                return response, "confirmed"
+            error = status.get("error") or {}
+            code = int(error.get("code") or 0) if str(error.get("code") or "").lstrip("-").isdigit() else 0
+            error_message = str(error.get("message") or "")
+            logging.error(
+                "outbound delivery failed chat=%s message_id=%s kind=%s detail=%s attempt=%d code=%s message=%s",
+                chat_id, message_id, kind, detail, attempt, code, error_message,
+            )
+            if code == 429:
+                import re
+                match = re.search(r"retry after (\d+)", error_message, re.IGNORECASE)
+                raise TelegramFloodWait(int(match.group(1)) if match else 60)
+            if attempt == 2:
+                return response, "failed"
+        raise RuntimeError("unreachable send retry state")
+
+    async def _send_text(self, chat_id: int, text: str) -> int:
+        chunks = split_outbound_text(text)
+        for index, chunk in enumerate(chunks):
+            response, delivery = await self._send_confirmed(
+                {
+                    "@type": "sendMessage",
+                    "chat_id": chat_id,
+                    "input_message_content": {
+                        "@type": "inputMessageText",
+                        "text": {"@type": "formattedText", "text": chunk},
+                    },
+                },
+                chat_id=chat_id,
+                kind="text",
+                detail=f"chunk={index + 1}/{len(chunks)} chars={len(chunk)}",
+            )
+            logging.info(
+                "outbound chunk sent chat=%s message_id=%s chars=%d delivery=%s",
+                chat_id,
+                response.get("id") if isinstance(response, dict) else None,
+                len(chunk),
+                delivery,
+            )
+            if index + 1 < len(chunks):
+                await asyncio.sleep(2.0)
+        return len(chunks)
+
+
+    async def _send_reply(self, chat_id: int, reply: str, trace_id: str = "") -> None:
+        """Send one consolidated text message, then any stickers at the end.
+
+        Telegram flood limits apply per message request. Text is therefore no
+        longer split on model newlines; sticker markers are removed from the
+        text and their real sticker files are sent afterward.
+        """
+        parts = self.stickers.segment(reply) if self.stickers is not None else []
+        if parts:
+            text_parts = [part.text.strip() for part in parts if part.kind == "text" and part.text.strip()]
+            sticker_parts = [part.entry for part in parts if part.kind == "sticker" and part.entry is not None]
+            text = "\n".join(text_parts)
+        else:
+            text = reply.strip()
+            sticker_parts = []
+
+        text_chunks = 0
+        sticker_count = 0
+        if text:
+            if len(text) <= 4096:
+                response, delivery = await self._send_confirmed(
+                    {
+                        "@type": "sendMessage",
+                        "chat_id": chat_id,
+                        "input_message_content": {
+                            "@type": "inputMessageText",
+                            "text": {"@type": "formattedText", "text": text},
+                        },
+                    },
+                    chat_id=chat_id,
+                    kind="text",
+                    detail=f"consolidated chars={len(text)}",
+                )
+                logging.info(
+                    "outbound consolidated text chat=%s message_id=%s chars=%d delivery=%s",
+                    chat_id, response.get("id") if isinstance(response, dict) else None, len(text), delivery,
+                )
+                text_chunks = 1
+            else:
+                text_chunks = await self._send_text(chat_id, text)
+
+        for entry in sticker_parts:
+            await asyncio.sleep(2.0)
+            await self._send_sticker(chat_id, entry)
+            sticker_count += 1
+
+        logging.info(
+            "reply dispatch done chat=%s trace_id=%s mode=consolidated parts=[text,stickers_at_end] "
+            "text_chunks=%d stickers=%d reply_len=%d",
+            chat_id, trace_id or None, text_chunks, sticker_count, len(reply),
+        )
+
+
+    async def _send_sticker(self, chat_id: int, entry: Any) -> None:
+        from telegram_gateway.stickerkit import build_send_photo_request, build_send_sticker_request
+
+        if entry is None or entry.file_path is None or not Path(entry.file_path).is_file():
+            return
+        try:
+            response, delivery = await self._send_confirmed(
+                build_send_sticker_request(chat_id, Path(entry.file_path), entry.emoji),
+                chat_id=chat_id,
+                kind="sticker",
+                detail=f"name={entry.name} mode=sticker",
+            )
+            logging.info(
+                "outbound sticker sent chat=%s message_id=%s name=%s mode=sticker delivery=%s",
+                chat_id,
+                response.get("id") if isinstance(response, dict) else None,
+                entry.name,
+                delivery,
+            )
+        except TelegramFloodWait:
+            raise
+        except Exception:
+            try:
+                # fall back to a photo so the emotion still lands
+                response, delivery = await self._send_confirmed(
+                    build_send_photo_request(chat_id, Path(entry.file_path)),
+                    chat_id=chat_id,
+                    kind="photo_fallback",
+                    detail=f"name={entry.name}",
+                )
+                logging.info(
+                    "outbound sticker sent chat=%s message_id=%s name=%s mode=photo_fallback delivery=%s",
+                    chat_id,
+                    response.get("id") if isinstance(response, dict) else None,
+                    entry.name,
+                    delivery,
+                )
+            except TelegramFloodWait:
+                raise
+            except Exception:
+                logging.exception("sticker send failed: %s", entry.name)
+
+
+async def resend_stored_reply(trace_id: str, gateway: TelegramGateway | None = None) -> None:
+    """Re-dispatch one stored assistant reply without writing to Core storage."""
+    config = GatewayConfig.from_env()
+    row = sqlite3.connect(str(config.database_directory.parent.parent / ".." / "bot.db"))
+    try:
+        row.row_factory = sqlite3.Row
+        message = row.execute(
+            "SELECT session_id, content FROM messages "
+            "WHERE role = 'assistant' AND trace_id = ? ORDER BY id DESC LIMIT 1",
+            (trace_id,),
+        ).fetchone()
+    finally:
+        row.close()
+    if message is None:
+        raise RuntimeError(f"stored assistant reply not found for trace_id={trace_id}")
+    session_id = str(message["session_id"])
+    if not session_id.startswith("tg:"):
+        raise RuntimeError(f"trace is not a Telegram session: {session_id}")
+    chat_id = int(session_id.removeprefix("tg:"))
+    if chat_id not in config.allowed_chat_ids:
+        raise RuntimeError(f"chat is not in TELEGRAM_ALLOWED_CHAT_IDS: {chat_id}")
+    owns_gateway = gateway is None
+    gateway = gateway or TelegramGateway(config)
+    try:
+        if owns_gateway:
+            await gateway.start()
+        await gateway._send_reply(chat_id, str(message["content"]), trace_id=trace_id)
+        logging.info("resend complete trace_id=%s chat=%s storage_write=false", trace_id, chat_id)
+    finally:
+        if owns_gateway:
+            await gateway.close()
+
+
+async def run_gateway() -> None:
+    config = GatewayConfig.from_env()
+    gateway = TelegramGateway(config)
+    try:
+        await gateway.start()
+        resend_trace = os.getenv("NENO_RESEND_TRACE", "").strip()
+        if resend_trace:
+            await resend_stored_reply(resend_trace, gateway)
+            return
+        await gateway.run_updates()
+    finally:
+        await gateway.close()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--resend-trace", default=None)
+    args = parser.parse_args()
+    asyncio.run(resend_stored_reply(args.resend_trace) if args.resend_trace else run_gateway())
+
